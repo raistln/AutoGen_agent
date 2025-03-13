@@ -3,6 +3,9 @@ import os
 import json
 import requests
 from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import smtplib
@@ -10,20 +13,118 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from bs4 import BeautifulSoup
 import re
+from dotenv import load_dotenv
 
-# Configuración de los modelos
+# Cargar variables de entorno desde .env
+load_dotenv()
+
+# Configuración de Ollama para modelos locales
+OLLAMA_BASE_URL = "http://localhost:11434/api"
+DEFAULT_MODEL = "gemma:2b"  # Modelo ligero que funciona bien en CPU
+# Alternativas: orca-mini:3b, llama2:7b, phi2:3b
+
+def install_ollama_model(model_name):
+    """Intenta descargar el modelo de Ollama si no está disponible"""
+    print(f"Intentando descargar el modelo {model_name}...")
+    try:
+        url = f"{OLLAMA_BASE_URL}/pull"
+        headers = {"Content-Type": "application/json"}
+        data = {"name": model_name}
+       
+        # Esta operación puede tardar varios minutos dependiendo del modelo
+        response = requests.post(url, headers=headers, json=data)
+       
+        if response.status_code == 200:
+            print(f"✅ Modelo {model_name} descargado correctamente")
+            return True
+        else:
+            print(f"❌ Error al descargar el modelo: {response.status_code}")
+            print(response.text)
+            return False
+    except Exception as e:
+        print(f"❌ Error de conexión al intentar descargar: {e}")
+        return False
+
+def ask_ollama(prompt, model=DEFAULT_MODEL):
+    """
+    Realiza una consulta al servidor Ollama local
+   
+    Args:
+        prompt: El texto de la consulta
+        model: El modelo a utilizar
+       
+    Returns:
+        str: La respuesta del modelo
+    """
+    url = f"{OLLAMA_BASE_URL}/generate"
+   
+    headers = {
+        "Content-Type": "application/json"
+    }
+   
+    data = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False
+    }
+   
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 200:
+            return response.json().get("response", "")
+        else:
+            print(f"Error al consultar Ollama: {response.status_code}")
+            print(response.text)
+            return "Error al consultar el modelo"
+    except Exception as e:
+        print(f"Excepción al llamar a Ollama: {e}")
+        return "Error de conexión con Ollama"
+
+# Configuración de los modelos con opción de OpenAI o Ollama local
 config_list = [
     {
-        "model": "gpt-4",  # Puedes usar un modelo más potente para mejores resultados
+        "model": "gpt-4",
         "api_key": os.environ.get("OPENAI_API_KEY"),
     }
-    # Alternativamente, puedes seguir usando Ollama localmente
-    # {
-    #     "model": "mistral:7b",
-    #     "api_key": "None",
-    #     "base_url": "http://localhost:11434",
-    # }
 ]
+
+# Configuración alternativa con Ollama
+config_list_ollama = [
+    {
+        "model": DEFAULT_MODEL,
+        "api_key": "None",
+        "base_url": "http://localhost:11434",
+    }
+]
+
+# Función para determinar qué configuración usar
+def get_config():
+    try:
+        # Verificar si podemos usar OpenAI
+        if os.environ.get("OPENAI_API_KEY"):
+            return config_list
+        # Si no, intentar usar Ollama
+        else:
+            # Comprobar si el modelo está instalado, si no, intentar instalarlo
+            try:
+                response = requests.post(
+                    f"{OLLAMA_BASE_URL}/generate", 
+                    json={"model": DEFAULT_MODEL, "prompt": "test", "stream": False}
+                )
+                if response.status_code == 200:
+                    print(f"Usando modelo local: {DEFAULT_MODEL}")
+                    return config_list_ollama
+                else:
+                    install_ollama_model(DEFAULT_MODEL)
+                    return config_list_ollama
+            except Exception:
+                print("Error conectando con Ollama. Intentando instalar el modelo...")
+                install_ollama_model(DEFAULT_MODEL)
+                return config_list_ollama
+    except Exception as e:
+        print(f"Error al configurar el modelo: {e}")
+        print("Usando configuración de Ollama por defecto")
+        return config_list_ollama
 
 # Clase para manejar la búsqueda en internet usando DuckDuckGo
 class DuckDuckGoSearchTool:
@@ -167,10 +268,36 @@ class DuckDuckGoSearchTool:
                 ]
             }
 
+# Configuración de OAuth 2.0 para YouTube
+SCOPES = ['https://www.googleapis.com/auth/youtube']
+CLIENT_SECRETS_FILE = 'client_secret.json'  # Archivo descargado de Google Cloud Console
+
+def get_authenticated_service():
+    """Obtiene un servicio autenticado de YouTube usando OAuth 2.0"""
+    creds = None
+    
+    # El archivo token.json almacena los tokens de acceso y actualización
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    
+    # Si no hay credenciales válidas, solicita al usuario que inicie sesión
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        # Guarda las credenciales para la próxima vez
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+    
+    return build('youtube', 'v3', credentials=creds)
+
 # Clase para interactuar con YouTube
 class YouTubeTool:
-    def __init__(self, api_key):
-        self.api_key = api_key
+    def __init__(self):
+        self.youtube = get_authenticated_service()
     
     def create_playlist(self, title, description, songs):
         """
@@ -178,11 +305,8 @@ class YouTubeTool:
         de los videos encontrados junto con el enlace a la playlist
         """
         try:
-            # Usando la API de YouTube
-            youtube = build("youtube", "v3", developerKey=self.api_key)
-            
             # Crear la lista de reproducción
-            playlist = youtube.playlists().insert(
+            playlist = self.youtube.playlists().insert(
                 part="snippet,status",
                 body={
                     "snippet": {
@@ -203,7 +327,7 @@ class YouTubeTool:
             # Buscar y añadir cada canción
             for song in songs:
                 # Buscar el video
-                search_response = youtube.search().list(
+                search_response = self.youtube.search().list(
                     q=song,
                     part="id,snippet",
                     maxResults=1,
@@ -224,7 +348,7 @@ class YouTubeTool:
                     })
                     
                     # Añadir a la lista de reproducción
-                    youtube.playlistItems().insert(
+                    self.youtube.playlistItems().insert(
                         part="snippet",
                         body={
                             "snippet": {
@@ -256,13 +380,28 @@ class YouTubeTool:
 
 # Clase para interactuar con Spotify
 class SpotifyTool:
-    def __init__(self, client_id, client_secret, redirect_uri):
-        self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=redirect_uri,
-            scope="playlist-modify-public"
-        ))
+    def __init__(self):
+        self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
+        self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+        self.redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI")
+        self.sp = None
+        self.initialize_spotify()
+    
+    def initialize_spotify(self):
+        """Inicializa la conexión con Spotify si las credenciales están disponibles"""
+        try:
+            if self.client_id and self.client_secret:
+                self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    redirect_uri=self.redirect_uri,
+                    scope="playlist-modify-public"
+                ))
+                print("Spotify inicializado correctamente")
+            else:
+                print("Credenciales de Spotify no disponibles")
+        except Exception as e:
+            print(f"Error al inicializar Spotify: {e}")
     
     def create_playlist(self, title, description, songs):
         """
@@ -270,6 +409,13 @@ class SpotifyTool:
         junto con información de las canciones añadidas
         """
         try:
+            # Verificar que Spotify esté inicializado
+            if not self.sp:
+                print("Spotify no está inicializado, intentando nuevamente...")
+                self.initialize_spotify()
+                if not self.sp:
+                    raise Exception("No se pudo inicializar Spotify")
+            
             # Obtener el ID del usuario actual
             user_id = self.sp.current_user()["id"]
             
@@ -330,13 +476,15 @@ class SpotifyTool:
 # Clase para enviar notificaciones
 class NotificationTool:
     def send_email(self, to_email, subject, body):
-        """Envía un correo electrónico"""
         try:
-            # Configuración del servidor de correo
             smtp_server = "smtp.gmail.com"
             smtp_port = 587
-            sender_email = os.environ.get("EMAIL_USER")
-            sender_password = os.environ.get("EMAIL_PASSWORD")
+            sender_email = os.getenv("EMAIL_USER")
+            sender_password = os.getenv("EMAIL_PASSWORD")
+            
+            if not sender_email or not sender_password:
+                print("Credenciales de correo no disponibles")
+                return False
             
             # Crear el mensaje
             message = MIMEMultipart()
@@ -369,12 +517,15 @@ class NotificationTool:
         print(f"Enviando mensaje de WhatsApp a {phone_number}: {message}")
         return True
 
+# Configuración dinámica para elegir entre OpenAI y Ollama
+active_config = get_config()
+
 # Configuración de agentes con herramientas externas
 search_tool = DuckDuckGoSearchTool()
-youtube_tool = YouTubeTool(api_key=os.environ.get("YOUTUBE_API_KEY", "TU_API_KEY"))
+youtube_tool = YouTubeTool()
 spotify_tool = SpotifyTool(
-    client_id=os.environ.get("SPOTIFY_CLIENT_ID", "TU_CLIENT_ID"),
-    client_secret=os.environ.get("SPOTIFY_CLIENT_SECRET", "TU_CLIENT_SECRET"),
+    client_id=os.environ.get("SPOTIFY_CLIENT_ID"),
+    client_secret=os.environ.get("SPOTIFY_CLIENT_SECRET"),
     redirect_uri="http://localhost:8888/callback"
 )
 notification_tool = NotificationTool()
@@ -382,7 +533,7 @@ notification_tool = NotificationTool()
 # Agente de Búsqueda en Internet
 search_agent = AssistantAgent(
     name="search_agent",
-    llm_config={"config_list": config_list},
+    llm_config={"config_list": active_config},
     system_message="""
     Eres un agente especializado en buscar listas de reproducción en internet.
     Tu tarea es encontrar las canciones más populares según el género o artista solicitado,
@@ -402,7 +553,7 @@ search_agent = AssistantAgent(
 # Agente de YouTube
 youtube_agent = AssistantAgent(
     name="youtube_agent",
-    llm_config={"config_list": config_list},
+    llm_config={"config_list": active_config},
     system_message="""
     Eres un agente especializado en crear listas de reproducción en YouTube.
     Tu tarea es tomar una lista de canciones proporcionada por el agente de búsqueda,
@@ -428,7 +579,7 @@ youtube_agent = AssistantAgent(
 # Agente de Spotify
 spotify_agent = AssistantAgent(
     name="spotify_agent",
-    llm_config={"config_list": config_list},
+    llm_config={"config_list": active_config},
     system_message="""
     Eres un agente especializado en crear listas de reproducción en Spotify.
     Tu tarea es tomar una lista de canciones proporcionada por el agente de búsqueda,
@@ -460,7 +611,7 @@ spotify_agent = AssistantAgent(
 # Agente de Notificaciones
 notification_agent = AssistantAgent(
     name="notification_agent",
-    llm_config={"config_list": config_list},
+    llm_config={"config_list": active_config},
     system_message="""
     Eres un agente especializado en enviar notificaciones.
     Tu tarea es enviar mensajes por correo electrónico o WhatsApp
@@ -581,7 +732,11 @@ def create_music_recommendation(query, email=None, phone=None):
 
 # Ejemplo de uso
 if __name__ == "__main__":
-    # Configurar tus claves de API como variables de entorno antes de ejecutar
+    # Verificar disponibilidad de API keys
+    if not os.environ.get("SPOTIFY_CLIENT_ID") or not os.environ.get("SPOTIFY_CLIENT_SECRET"):
+        print("⚠️ ADVERTENCIA: No se encontraron las credenciales de Spotify")
+    
+    # Ejecutar el flujo de recomendación de música
     result = create_music_recommendation(
         query="AC/DC",
         email="usuario@ejemplo.com",
