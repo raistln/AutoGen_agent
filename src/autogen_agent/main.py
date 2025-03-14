@@ -129,53 +129,39 @@ def get_config():
 # Clase para manejar la búsqueda en internet usando DuckDuckGo
 class DuckDuckGoSearchTool:
     def search_playlists(self, query):
-        """Busca listas de reproducción en internet usando DuckDuckGo"""
-        search_query = f"{query} playlist top songs"
-        print(f"Buscando listas de reproducción para: {search_query}")
+        """Busca listas de reproducción usando DuckDuckGo y un modelo de lenguaje (LLM)"""
+        print(f"Buscando listas de reproducción para: {query}")
         
         try:
-            # Construir la URL de búsqueda de DuckDuckGo
+            # Realiza una búsqueda en DuckDuckGo
+            search_query = f"{query} playlist top songs"
             url = f"https://api.duckduckgo.com/?q={search_query}&format=json"
             response = requests.get(url)
             results = response.json()
             
-            # En caso de que la API de DuckDuckGo no devuelva resultados útiles,
-            # hacemos una búsqueda web normal y parseamos los resultados
-            if not results.get('RelatedTopics'):
-                html_url = f"https://html.duckduckgo.com/html/?q={search_query}"
-                html_response = requests.get(html_url)
-                soup = BeautifulSoup(html_response.text, 'html.parser')
-                
-                # Extracción de resultados
-                links = soup.find_all('a', class_='result__a')
-                songs = self._extract_songs_from_results(links, query)
-                
-                # Si no encontramos suficientes canciones, usamos el respaldo
-                if len(songs) < 5:
-                    return self._fallback_search(query)
-                
-                return {
-                    "playlists": [
-                        {
-                            "title": f"Top canciones de {query} (DuckDuckGo)",
-                            "songs": songs
-                        }
-                    ]
-                }
-            
-            # Procesamos los resultados de la API si están disponibles
+            # Extrae los textos de los resultados
+            texts = []
             topics = results.get('RelatedTopics', [])
-            songs = []
-            
             for topic in topics:
                 if 'Text' in topic:
-                    # Intentamos extraer nombres de canciones del texto
-                    text = topic['Text']
-                    potential_songs = self._extract_song_names(text, query)
-                    songs.extend(potential_songs)
+                    texts.append(topic['Text'])
             
-            # Eliminamos duplicados y limitamos a 10 canciones
-            songs = list(dict.fromkeys(songs))[:10]
+            # Si no hay suficientes resultados, usa el respaldo
+            if len(texts) < 3:
+                return self._fallback_search(query)
+            
+            # Envía los textos al LLM para extraer canciones
+            prompt = f"""
+            A continuación se muestran los resultados de una búsqueda sobre '{query}'. 
+            Extrae una lista de las 10 canciones más relevantes. Devuélvelo como una lista de Python, por ejemplo: ['Canción 1', 'Canción 2', ...]
+            
+            Resultados de la búsqueda:
+            {texts}
+            """
+            response = ask_ollama(prompt)  # Usa el LLM local (Ollama) o GPT-4
+            
+            # Extrae la lista de canciones de la respuesta del LLM
+            songs = self._parse_llm_response(response)
             
             # Si no encontramos suficientes canciones, usamos el respaldo
             if len(songs) < 5:
@@ -184,53 +170,43 @@ class DuckDuckGoSearchTool:
             return {
                 "playlists": [
                     {
-                        "title": f"Top canciones de {query} (DuckDuckGo)",
+                        "title": f"Top canciones de {query} (DuckDuckGo + LLM)",
                         "songs": songs
                     }
                 ]
             }
             
         except Exception as e:
-            print(f"Error en la búsqueda de DuckDuckGo: {e}")
+            print(f"Error en la búsqueda de DuckDuckGo o al consultar el LLM: {e}")
             return self._fallback_search(query)
-    
-    def _extract_songs_from_results(self, links, query):
-        """Extrae nombres de canciones de los resultados de búsqueda"""
-        songs = []
-        for link in links[:20]:  # Limitar a los primeros 20 resultados
-            text = link.get_text()
-            potential_songs = self._extract_song_names(text, query)
-            songs.extend(potential_songs)
         
-        # Eliminar duplicados y limitar a 10
-        return list(dict.fromkeys(songs))[:10]
-    
-    def _extract_song_names(self, text, artist_or_genre):
+    def _parse_llm_response(self, response):
         """
-        Extrae posibles nombres de canciones de un texto
-        basado en patrones comunes de listas de canciones
+        Extrae la lista de canciones de la respuesta del LLM.
+        La respuesta debe ser una lista de Python, por ejemplo: ['Canción 1', 'Canción 2', ...]
         """
-        # Patrones para identificar canciones
-        patterns = [
-            r'"([^"]+)"',  # Texto entre comillas
-            r"'([^']+)'",  # Texto entre comillas simples
-            r'(?:^|\s)([A-Z][a-zA-Z\s\']+)(?:\s-|\sby)',  # Título capitalizado seguido de "by" o "-"
-            r'(?:^|\d\.\s)([A-Z][a-zA-Z\s\']+)(?:$|\n)',  # Título numerado (1. Título)
-            r'(?<=\n|\s)([A-Z][a-zA-Z0-9\s\']+)(?=\n|\s|$)'  # Líneas que comienzan con mayúscula
-        ]
+        try:
+            # Busca la lista en la respuesta (puede estar entre ```python ``` o ser una lista directa)
+            if "```python" in response:
+                # Extrae el contenido entre ```python ```
+                start = response.find("```python") + len("```python")
+                end = response.find("```", start)
+                list_str = response[start:end].strip()
+            else:
+                # Asume que la respuesta es una lista directa
+                list_str = response.strip()
+            
+            # Convierte la cadena en una lista de Python
+            songs = eval(list_str)
+            if isinstance(songs, list):
+                return songs[:10]  # Limita a 10 canciones
+            else:
+                raise ValueError("La respuesta no es una lista válida")
         
-        potential_songs = []
+        except Exception as e:
+            print(f"Error al parsear la respuesta del LLM: {e}")
+            return []
         
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                # Filtrar para evitar falsos positivos
-                if len(match) > 3 and len(match) < 50:
-                    if artist_or_genre.lower() not in match.lower():
-                        potential_songs.append(match.strip())
-        
-        return potential_songs
-    
     def _fallback_search(self, query):
         """Proporciona resultados de respaldo en caso de fallo"""
         print("Usando búsqueda de respaldo")
@@ -285,15 +261,12 @@ def get_authenticated_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            # Configuración más explícita del flujo de OAuth
             flow = InstalledAppFlow.from_client_secrets_file(
                 CLIENT_SECRETS_FILE,
-                scopes=SCOPES
+                scopes=SCOPES,
+                redirect_uri="http://127.0.0.1:8888/callback"  # Usar 127.0.0.1 en lugar de localhost
             )
-            # Configura el servidor local para usar exactamente la URI que está en Google Cloud
-            flow.redirect_uri = "http://localhost:8888"
-            # Inicia el servidor en el mismo puerto
-            creds = flow.run_local_server(port=8888, redirect_uri_port=8888)
+            creds = flow.run_local_server(port=0)
         
         # Guarda las credenciales para la próxima vez
         with open('token.json', 'w') as token:
@@ -483,12 +456,15 @@ class SpotifyTool:
 # Clase para enviar notificaciones
 class NotificationTool:
     def send_email(self, to_email, subject, body):
+        """Envía un correo electrónico"""
         try:
+            # Configuración del servidor de correo
             smtp_server = "smtp.gmail.com"
             smtp_port = 587
             sender_email = os.getenv("EMAIL_USER")
             sender_password = os.getenv("EMAIL_PASSWORD")
             
+            # Verificar que las credenciales estén disponibles
             if not sender_email or not sender_password:
                 print("Credenciales de correo no disponibles")
                 return False
@@ -646,14 +622,6 @@ coordinator = UserProxyAgent(
 def create_music_recommendation(query, email=None, phone=None):
     """
     Flujo completo para crear y compartir listas de reproducción
-    
-    Args:
-        query: Consulta del usuario (artista, género, etc.)
-        email: Correo electrónico para enviar los resultados
-        phone: Número de teléfono para WhatsApp
-    
-    Returns:
-        dict: Resultado con las URLs de las listas y mensajes de estado
     """
     # Paso 1: Buscar y analizar listas de reproducción
     print(f"Iniciando búsqueda para: {query}")
@@ -673,7 +641,7 @@ def create_music_recommendation(query, email=None, phone=None):
     playlist_title = f"Playlist Recomendada: {query}"
     playlist_description = f"Lista de reproducción generada automáticamente para '{query}'"
     
-    # Crear en YouTube
+    # Crear en YouTube (comentado para pruebas de Spotify)
     youtube_result = youtube_tool.create_playlist(
         title=playlist_title,
         description=playlist_description,
@@ -698,14 +666,14 @@ def create_music_recommendation(query, email=None, phone=None):
     {', '.join(selected_songs)}
     
     Escúchala en:
-    - YouTube: {youtube_result['playlist_url']}
     - Spotify: {spotify_result['playlist_url']}
-    
-    Detalles de YouTube:
     """
     
-    for video in youtube_result['video_urls']:
-        message_body += f"\n- {video['song']}: {video['url']}"
+    #Añadir detalles de YouTube si está habilitado
+    if youtube_result:
+        message_body += "\n\nDetalles de YouTube:"
+        for video in youtube_result['video_urls']:
+            message_body += f"\n- {video['song']}: {video['url']}"
     
     message_body += "\n\n¡Disfruta la música!"
     
@@ -728,10 +696,11 @@ def create_music_recommendation(query, email=None, phone=None):
     return {
         "query": query,
         "songs": selected_songs,
-        "youtube_result": youtube_result,
+        "youtube_result": {},  # Devolver un diccionario vacío para YouTube
         "spotify_result": spotify_result,
         "notification_sent": notification_sent
     }
+    
 
 # Ejemplo de uso
 if __name__ == "__main__":
@@ -746,4 +715,7 @@ if __name__ == "__main__":
         # phone="+1234567890"  # Descomentar para enviar por WhatsApp
     )
     
-    print(json.dumps(result, indent=2))
+    # Mostrar resultados de manera más amigable
+    print("\n🎵 Lista de reproducción creada exitosamente 🎵")
+    print(f"🔍 Búsqueda: {result['query']}")
+    print("\n🎶 Canciones incluidas:")
