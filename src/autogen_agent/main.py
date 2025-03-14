@@ -285,8 +285,15 @@ def get_authenticated_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
+            # Configuración más explícita del flujo de OAuth
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CLIENT_SECRETS_FILE,
+                scopes=SCOPES
+            )
+            # Configura el servidor local para usar exactamente la URI que está en Google Cloud
+            flow.redirect_uri = "http://localhost:8888"
+            # Inicia el servidor en el mismo puerto
+            creds = flow.run_local_server(port=8888, redirect_uri_port=8888)
         
         # Guarda las credenciales para la próxima vez
         with open('token.json', 'w') as token:
@@ -523,11 +530,7 @@ active_config = get_config()
 # Configuración de agentes con herramientas externas
 search_tool = DuckDuckGoSearchTool()
 youtube_tool = YouTubeTool()
-spotify_tool = SpotifyTool(
-    client_id=os.environ.get("SPOTIFY_CLIENT_ID"),
-    client_secret=os.environ.get("SPOTIFY_CLIENT_SECRET"),
-    redirect_uri="http://localhost:8888/callback"
-)
+spotify_tool = SpotifyTool()
 notification_tool = NotificationTool()
 
 # Agente de Búsqueda en Internet

@@ -26,7 +26,7 @@ def install_ollama_model(model_name):
         else:
             print(f"❌ Error al descargar el modelo: {response.status_code}")
             print(response.text)
-            return False
+            return False 
     except Exception as e:
         print(f"❌ Error de conexión al intentar descargar: {e}")
         return False
