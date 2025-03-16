@@ -1,19 +1,20 @@
 from autogen import AssistantAgent, UserProxyAgent, config_list_from_json
 import os
-import json
 import requests
+from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import re
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
 from bs4 import BeautifulSoup
 import re
-from dotenv import load_dotenv
+
 
 # Cargar variables de entorno desde .env
 load_dotenv()
@@ -21,10 +22,17 @@ load_dotenv()
 # Configuración de Ollama para modelos locales
 OLLAMA_BASE_URL = "http://localhost:11434/api"
 DEFAULT_MODEL = "gemma:2b"  # Modelo ligero que funciona bien en CPU
-# Alternativas: orca-mini:3b, llama2:7b, phi2:3b
 
 def install_ollama_model(model_name):
-    """Intenta descargar el modelo de Ollama si no está disponible"""
+    """
+    Intenta descargar el modelo de Ollama si no está disponible.
+   
+    Args:
+        model_name (str): El nombre del modelo a descargar.
+   
+    Returns:
+        bool: True si el modelo se descargó correctamente, False en caso contrario.
+    """
     print(f"Intentando descargar el modelo {model_name}...")
     try:
         url = f"{OLLAMA_BASE_URL}/pull"
@@ -47,14 +55,14 @@ def install_ollama_model(model_name):
 
 def ask_ollama(prompt, model=DEFAULT_MODEL):
     """
-    Realiza una consulta al servidor Ollama local
+    Realiza una consulta al servidor Ollama local.
    
     Args:
-        prompt: El texto de la consulta
-        model: El modelo a utilizar
-       
+        prompt (str): El texto de la consulta.
+        model (str): El modelo a utilizar (por defecto: gemma:2b).
+   
     Returns:
-        str: La respuesta del modelo
+        str: La respuesta del modelo.
     """
     url = f"{OLLAMA_BASE_URL}/generate"
    
@@ -97,8 +105,13 @@ config_list_ollama = [
     }
 ]
 
-# Función para determinar qué configuración usar
 def get_config():
+    """
+    Determina la configuración del modelo a utilizar (OpenAI o Ollama).
+   
+    Returns:
+        list: La lista de configuración del modelo.
+    """
     try:
         # Verificar si podemos usar OpenAI
         if os.environ.get("OPENAI_API_KEY"):
@@ -126,130 +139,132 @@ def get_config():
         print("Usando configuración de Ollama por defecto")
         return config_list_ollama
 
-# Clase para manejar la búsqueda en internet usando DuckDuckGo
-class DuckDuckGoSearchTool:
-    def search_playlists(self, query):
-        """Busca listas de reproducción usando DuckDuckGo y un modelo de lenguaje (LLM)"""
-        print(f"Buscando listas de reproducción para: {query}")
-        
-        try:
-            # Realiza una búsqueda en DuckDuckGo
-            search_query = f"{query} playlist top songs"
-            url = f"https://api.duckduckgo.com/?q={search_query}&format=json"
-            response = requests.get(url)
-            results = response.json()
-            
-            # Extrae los textos de los resultados
-            texts = []
-            topics = results.get('RelatedTopics', [])
-            for topic in topics:
-                if 'Text' in topic:
-                    texts.append(topic['Text'])
-            
-            # Si no hay suficientes resultados, usa el respaldo
-            if len(texts) < 3:
-                return self._fallback_search(query)
-            
-            # Envía los textos al LLM para extraer canciones
-            prompt = f"""
-            A continuación se muestran los resultados de una búsqueda sobre '{query}'. 
-            Extrae una lista de las 10 canciones más relevantes. Devuélvelo como una lista de Python, por ejemplo: ['Canción 1', 'Canción 2', ...]
-            
-            Resultados de la búsqueda:
-            {texts}
-            """
-            response = ask_ollama(prompt)  # Usa el LLM local (Ollama) o GPT-4
-            
-            # Extrae la lista de canciones de la respuesta del LLM
-            songs = self._parse_llm_response(response)
-            
-            # Si no encontramos suficientes canciones, usamos el respaldo
-            if len(songs) < 5:
-                return self._fallback_search(query)
-            
-            return {
-                "playlists": [
-                    {
-                        "title": f"Top canciones de {query} (DuckDuckGo + LLM)",
-                        "songs": songs
-                    }
-                ]
-            }
-            
-        except Exception as e:
-            print(f"Error en la búsqueda de DuckDuckGo o al consultar el LLM: {e}")
-            return self._fallback_search(query)
-        
-    def _parse_llm_response(self, response):
+class MusicSearchTool:
+    def __init__(self):
         """
-        Extrae la lista de canciones de la respuesta del LLM.
-        La respuesta debe ser una lista de Python, por ejemplo: ['Canción 1', 'Canción 2', ...]
+        Inicializa la herramienta de búsqueda de música.
         """
-        try:
-            # Busca la lista en la respuesta (puede estar entre ```python ``` o ser una lista directa)
-            if "```python" in response:
-                # Extrae el contenido entre ```python ```
-                start = response.find("```python") + len("```python")
-                end = response.find("```", start)
-                list_str = response[start:end].strip()
-            else:
-                # Asume que la respuesta es una lista directa
-                list_str = response.strip()
+        print("🛠️ Inicializando MusicSearchTool...")
+        
+        # Cargar credenciales de Last.fm desde variables de entorno
+        self.lastfm_api_key = os.getenv("LASTFM_API_KEY")
+        self.lastfm_api_secret = os.getenv("LASTFM_API_SECRET")
+        
+        if not self.lastfm_api_key or not self.lastfm_api_secret:
+            raise ValueError("Las credenciales de Last.fm no están configuradas.")
+
+    def search_playlists(self, query, num_songs=20):
+        """
+        Busca listas de reproducción utilizando Last.fm y Spotify como respaldo.
+        Evita duplicados en todas las etapas y devuelve una lista única de canciones.
+       
+        Args:
+            query (str): El término de búsqueda (artista, género, etc.).
+            num_songs (int): El número de canciones a devolver (por defecto: 20).
+       
+        Returns:
+            list: Una lista de canciones únicas en formato Python.
+        """
+        print(f"\n🎵 Iniciando búsqueda para: {query}")
+        
+        # Conjunto para almacenar canciones únicas
+        unique_songs = set()
+        
+        # 1. Intento: Búsqueda en Last.fm (API)
+        print("\n🔍 Paso 1: Búsqueda en Last.fm (API)...")
+        songs_from_lastfm = self._search_via_lastfm(query)
+        print(f"✅ Canciones encontradas en Last.fm (API): {songs_from_lastfm}")
+        
+        # Añadir canciones de Last.fm al conjunto de canciones únicas
+        unique_songs.update(songs_from_lastfm)
+        
+        # 2. Intento: Búsqueda en Spotify (API)
+        if len(unique_songs) < num_songs:
+            print("\n🔍 Paso 2: Búsqueda en Spotify (API)...")
+            print("⚠️ No se encontraron suficientes canciones. Usando Spotify...")
+            songs_from_spotify = self._search_via_spotify(query)
+            print(f"✅ Canciones encontradas en Spotify (API): {songs_from_spotify}")
             
-            # Convierte la cadena en una lista de Python
-            songs = eval(list_str)
-            if isinstance(songs, list):
-                return songs[:10]  # Limita a 10 canciones
-            else:
-                raise ValueError("La respuesta no es una lista válida")
+            # Añadir canciones de Spotify al conjunto de canciones únicas
+            unique_songs.update(songs_from_spotify)
         
-        except Exception as e:
-            print(f"Error al parsear la respuesta del LLM: {e}")
-            return []
+        # Convertir el conjunto a una lista y limitar al número solicitado
+        print("\n🔍 Paso 3: Eliminando duplicados y limitando resultados...")
+        unique_songs_list = list(unique_songs)[:num_songs]
+        print(f"✅ Canciones únicas encontradas: {len(unique_songs_list)}")
         
-    def _fallback_search(self, query):
-        """Proporciona resultados de respaldo en caso de fallo"""
-        print("Usando búsqueda de respaldo")
-        # Datos de ejemplo - se utilizan cuando la búsqueda real falla
-        if "ac/dc" in query.lower():
-            return {
-                "playlists": [
-                    {
-                        "title": "Los mejores éxitos de AC/DC",
-                        "songs": ["Back in Black", "Highway to Hell", "Thunderstruck", 
-                                 "You Shook Me All Night Long", "Hells Bells"]
-                    }
-                ]
-            }
-        elif "rock" in query.lower():
-            return {
-                "playlists": [
-                    {
-                        "title": "Rock Clásico",
-                        "songs": ["Sweet Child O' Mine", "Welcome to the Jungle", 
-                                 "Livin' on a Prayer", "Final Countdown", "Jump"]
-                    }
-                ]
-            }
+        # Log de diagnóstico
+        print("\n📊 Resumen de la búsqueda:")
+        print(f"- Total de canciones encontradas: {len(unique_songs_list)}")
+        print(f"- Canciones: {unique_songs_list}")
+        
+        return unique_songs_list
+    
+    def _search_via_lastfm(self, query):
+        """
+        Realiza búsquedas mediante la API de Last.fm.
+       
+        Args:
+            query (str): El término de búsqueda (artista, género, etc.).
+       
+        Returns:
+            list: Una lista de nombres de canciones.
+        """
+        url = f"http://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks&artist={query}&api_key={self.lastfm_api_key}&format=json"
+        print(f"📄 Realizando solicitud HTTP a: {url}")
+        response = requests.get(url)
+        
+        if response.status_code == 200:
+            data = response.json()
+            songs = [track['name'] for track in data.get('toptracks', {}).get('track', [])]
+            return songs
         else:
-            # Búsqueda genérica de respaldo
-            return {
-                "playlists": [
-                    {
-                        "title": f"Playlist de {query}",
-                        "songs": [f"Canción 1 de {query}", f"Canción 2 de {query}", 
-                                 f"Canción 3 de {query}", f"Canción 4 de {query}", 
-                                 f"Canción 5 de {query}"]
-                    }
-                ]
-            }
+            print(f"❌ Error en la búsqueda de Last.fm: {response.status_code}")
+            return []
+    
+    def _search_via_spotify(self, query):
+        """
+        Realiza búsquedas mediante la API de Spotify.
+    
+        Args:
+            query (str): El término de búsqueda (artista, género, etc.).
+    
+        Returns:
+            list: Una lista de nombres de canciones.
+        """
+        # Autenticación en Spotify
+        sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
+            client_id=os.getenv("SPOTIFY_CLIENT_ID"),
+            client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
+            redirect_uri=os.getenv("SPOTIFY_REDIRECT_URI"),
+            scope="user-library-read",
+            cache_path=os.path.join(os.path.expanduser("~"), ".spotify_cache")
+        ))
+        
+        # Realizar la búsqueda incluyendo el nombre del artista
+        search_query = f"track:{query} artist:{query}"
+        results = sp.search(q=search_query, type='track', limit=20)
+        
+        # Filtrar canciones que coincidan con el artista
+        songs = []
+        for track in results['tracks']['items']:
+            artist_names = [artist['name'].lower() for artist in track['artists']]
+            if query.lower() in artist_names:
+                songs.append(track['name'])
+        
+        return songs
 
 # Configuración de OAuth 2.0 para YouTube
 SCOPES = ['https://www.googleapis.com/auth/youtube']
 CLIENT_SECRETS_FILE = 'client_secret.json'  # Archivo descargado de Google Cloud Console
 
 def get_authenticated_service():
-    """Obtiene un servicio autenticado de YouTube usando OAuth 2.0"""
+    """
+    Obtiene un servicio autenticado de YouTube usando OAuth 2.0.
+   
+    Returns:
+        googleapiclient.discovery.Resource: Un servicio autenticado de YouTube.
+    """
     creds = None
     
     # El archivo token.json almacena los tokens de acceso y actualización
@@ -261,12 +276,15 @@ def get_authenticated_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            # Configuración más explícita del flujo de OAuth
             flow = InstalledAppFlow.from_client_secrets_file(
                 CLIENT_SECRETS_FILE,
-                scopes=SCOPES,
-                redirect_uri="http://127.0.0.1:8888/callback"  # Usar 127.0.0.1 en lugar de localhost
+                scopes=SCOPES
             )
-            creds = flow.run_local_server(port=0)
+            # Configura el servidor local para usar exactamente la URI que está en Google Cloud
+            flow.redirect_uri = "http://localhost:8888"
+            # Inicia el servidor en el mismo puerto
+            creds = flow.run_local_server(port=8888, redirect_uri_port=8888)
         
         # Guarda las credenciales para la próxima vez
         with open('token.json', 'w') as token:
@@ -274,17 +292,30 @@ def get_authenticated_service():
     
     return build('youtube', 'v3', credentials=creds)
 
-# Clase para interactuar con YouTube
 class YouTubeTool:
     def __init__(self):
+        """
+        Inicializa la clase YouTubeTool con un servicio autenticado de YouTube.
+        """
         self.youtube = get_authenticated_service()
     
     def create_playlist(self, title, description, songs):
         """
         Crea una lista de reproducción en YouTube y devuelve una lista de URLs
-        de los videos encontrados junto con el enlace a la playlist
+        de los videos encontrados junto con el enlace a la playlist.
+    
+        Args:
+            title (str): El título de la playlist.
+            description (str): La descripción de la playlist.
+            songs (list): Una lista de nombres de canciones.
+    
+        Returns:
+            dict: Un diccionario con la URL de la playlist y las URLs de los videos.
         """
         try:
+            # Convertir el título a mayúsculas
+            title = title.upper()
+            
             # Crear la lista de reproducción
             playlist = self.youtube.playlists().insert(
                 part="snippet,status",
@@ -358,9 +389,11 @@ class YouTubeTool:
                 ]
             }
 
-# Clase para interactuar con Spotify
 class SpotifyTool:
     def __init__(self):
+        """
+        Inicializa la clase SpotifyTool con las credenciales de Spotify.
+        """
         self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
         self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         self.redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI")
@@ -368,27 +401,58 @@ class SpotifyTool:
         self.initialize_spotify()
     
     def initialize_spotify(self):
-        """Inicializa la conexión con Spotify si las credenciales están disponibles"""
+        """
+        Inicializa la conexión con Spotify con mejor manejo de errores de caché.
+        """
         try:
             if self.client_id and self.client_secret:
+                # Establecer una ruta de caché específica y accesible
+                cache_path = os.path.join(os.path.expanduser("~"), ".spotify_cache")
+                # Crear el directorio si no existe
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                
                 self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
                     client_id=self.client_id,
                     client_secret=self.client_secret,
                     redirect_uri=self.redirect_uri,
-                    scope="playlist-modify-public"
+                    scope="playlist-modify-public",
+                    cache_path=cache_path
                 ))
                 print("Spotify inicializado correctamente")
             else:
                 print("Credenciales de Spotify no disponibles")
         except Exception as e:
             print(f"Error al inicializar Spotify: {e}")
+            # Intentar una inicialización alternativa en caso de error
+            try:
+                # Intentar usar Client Credentials Flow en lugar de OAuth si hay problemas
+                from spotipy.oauth2 import SpotifyClientCredentials
+                self.sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+                    client_id=self.client_id,
+                    client_secret=self.client_secret
+                ))
+                print("Spotify inicializado con credenciales de cliente")
+            except Exception as e2:
+                print(f"Error en la inicialización alternativa de Spotify: {e2}")
+                self.sp = None
     
     def create_playlist(self, title, description, songs):
         """
         Crea una lista de reproducción en Spotify y devuelve la URL
-        junto con información de las canciones añadidas
+        junto con información de las canciones añadidas.
+    
+        Args:
+            title (str): El título de la playlist.
+            description (str): La descripción de la playlist.
+            songs (list): Una lista de nombres de canciones.
+    
+        Returns:
+            dict: Un diccionario con la URL de la playlist y la información de las canciones.
         """
         try:
+            # Convertir el título a mayúsculas
+            title = title.upper()
+            
             # Verificar que Spotify esté inicializado
             if not self.sp:
                 print("Spotify no está inicializado, intentando nuevamente...")
@@ -406,7 +470,7 @@ class SpotifyTool:
                 public=True,
                 description=description
             )
-            
+                
             # Buscar y añadir cada canción
             track_info = []
             track_uris = []
@@ -453,18 +517,25 @@ class SpotifyTool:
                 ]
             }
 
-# Clase para enviar notificaciones
 class NotificationTool:
     def send_email(self, to_email, subject, body):
-        """Envía un correo electrónico"""
+        """
+        Envía un correo electrónico usando SMTP.
+       
+        Args:
+            to_email (str): El correo electrónico del destinatario.
+            subject (str): El asunto del correo.
+            body (str): El cuerpo del correo.
+       
+        Returns:
+            bool: True si el correo se envió correctamente, False en caso contrario.
+        """
         try:
-            # Configuración del servidor de correo
             smtp_server = "smtp.gmail.com"
             smtp_port = 587
             sender_email = os.getenv("EMAIL_USER")
             sender_password = os.getenv("EMAIL_PASSWORD")
             
-            # Verificar que las credenciales estén disponibles
             if not sender_email or not sender_password:
                 print("Credenciales de correo no disponibles")
                 return False
@@ -489,22 +560,12 @@ class NotificationTool:
         except Exception as e:
             print(f"Error al enviar correo electrónico: {e}")
             return False
-    
-    def send_whatsapp(self, phone_number, message):
-        """
-        Envía un mensaje de WhatsApp usando la API de WhatsApp Business
-        Nota: Esto requeriría una cuenta de WhatsApp Business API
-        """
-        # En una implementación real, aquí usarías la API de WhatsApp Business
-        # Este es un ejemplo simplificado
-        print(f"Enviando mensaje de WhatsApp a {phone_number}: {message}")
-        return True
 
 # Configuración dinámica para elegir entre OpenAI y Ollama
 active_config = get_config()
 
 # Configuración de agentes con herramientas externas
-search_tool = DuckDuckGoSearchTool()
+search_tool = MusicSearchTool()
 youtube_tool = YouTubeTool()
 spotify_tool = SpotifyTool()
 notification_tool = NotificationTool()
@@ -592,13 +653,24 @@ notification_agent = AssistantAgent(
     name="notification_agent",
     llm_config={"config_list": active_config},
     system_message="""
-    Eres un agente especializado en enviar notificaciones.
-    Tu tarea es enviar mensajes por correo electrónico o WhatsApp
-    con enlaces a listas de reproducción y una descripción amigable.
+    Eres un agente especializado en enviar notificaciones por correo electrónico.
+    Tu tarea es generar un correo electrónico con un estilo informal y divertido,
+    similar a un presentador de MTV, que incluya:
+    1. Un resumen de la playlist creada.
+    2. Enlaces a las listas de reproducción en YouTube y Spotify.
+    3. Una descripción amigable de las canciones incluidas.
+    
+    Formato de salida:
+    ```python
+    {
+        "subject": "Asunto del correo",
+        "body": "Cuerpo del correo"
+    }
+    ```
     """
 )
 
-# Agente Coordinador con capacidad de ejecución de código
+# Agente Coordinador
 coordinator = UserProxyAgent(
     name="coordinator",
     human_input_mode="NEVER",
@@ -618,104 +690,146 @@ coordinator = UserProxyAgent(
     """
 )
 
-# Función de flujo principal
-def create_music_recommendation(query, email=None, phone=None):
+def generate_email_content(query, youtube_result, spotify_result, songs):
     """
-    Flujo completo para crear y compartir listas de reproducción
+    Genera el contenido del correo electrónico usando el modelo Gemma 2B.
+   
+    Args:
+        query (str): El término de búsqueda (artista, género, etc.).
+        youtube_result (dict): Los resultados de YouTube.
+        spotify_result (dict): Los resultados de Spotify.
+        songs (list): La lista de canciones.
+   
+    Returns:
+        dict: Un diccionario con el asunto y el cuerpo del correo.
+    """
+    # Generar el asunto del correo (más corto e impactante)
+    subject_prompt = f"Generate a short and impactful email subject for a playlist about {query}. Max 10 words."
+    subject = ask_ollama(subject_prompt).strip()
+    
+    # Generar el cuerpo del correo
+    body_prompt = f"""
+    Eres un presentador de MTV y estás enviando un correo electrónico
+    con los detalles de una playlist creada automáticamente.
+    
+    La playlist es sobre: {query}.
+    Las canciones incluidas son: {', '.join(songs)}.
+    
+    Enlaces:
+    - YouTube: {youtube_result['playlist_url']}
+    - Spotify: {spotify_result['playlist_url']}
+    
+    Escribe un correo electrónico informal y divertido que incluya:
+    1. Un saludo amigable.
+    2. Un resumen de la playlist.
+    3. Los enlaces a YouTube y Spotify.
+    4. Una descripción amigable de las canciones.
+    """
+    body = ask_ollama(body_prompt).strip()
+    
+    return {
+        "subject": subject,
+        "body": body
+    }
+
+def create_music_recommendation(query, email=None, num_songs=20):
+    """
+    Flujo completo para crear y compartir listas de reproducción.
+   
+    Args:
+        query (str): El término de búsqueda (artista, género, etc.).
+        email (str): El correo electrónico para enviar los resultados.
+        num_songs (int): El número de canciones a incluir en la playlist (por defecto: 20).
+   
+    Returns:
+        dict: Resultado con las URLs de las listas y mensajes de estado.
     """
     # Paso 1: Buscar y analizar listas de reproducción
-    print(f"Iniciando búsqueda para: {query}")
-    search_results = search_tool.search_playlists(query)
-    
-    # Extraer canciones de los resultados
-    songs = []
-    for playlist in search_results["playlists"]:
-        songs.extend(playlist["songs"])
-    
-    # Eliminar duplicados y limitar a 10 canciones
-    selected_songs = list(dict.fromkeys(songs))[:10]
-    
-    print(f"Canciones seleccionadas: {selected_songs}")
+    songs = search_tool.search_playlists(query, num_songs)
     
     # Paso 2: Crear listas de reproducción en plataformas
     playlist_title = f"Playlist Recomendada: {query}"
     playlist_description = f"Lista de reproducción generada automáticamente para '{query}'"
     
-    # Crear en YouTube (comentado para pruebas de Spotify)
-    youtube_result = youtube_tool.create_playlist(
-        title=playlist_title,
-        description=playlist_description,
-        songs=selected_songs
-    )
+    youtube_result = youtube_tool.create_playlist(playlist_title, playlist_description, songs)
+    spotify_result = spotify_tool.create_playlist(playlist_title, playlist_description, songs)
     
-    # Crear en Spotify
-    spotify_result = spotify_tool.create_playlist(
-        title=playlist_title,
-        description=playlist_description,
-        songs=selected_songs
-    )
-    
-    # Paso 3: Enviar notificaciones si se proporcionaron datos de contacto
-    notification_sent = False
-    
-    # Crear mensaje con información detallada
-    message_body = f"""
-    ¡Hola! Tu lista de reproducción para "{query}" está lista.
-    
-    Canciones incluidas:
-    {', '.join(selected_songs)}
-    
-    Escúchala en:
-    - Spotify: {spotify_result['playlist_url']}
-    """
-    
-    #Añadir detalles de YouTube si está habilitado
-    if youtube_result:
-        message_body += "\n\nDetalles de YouTube:"
-        for video in youtube_result['video_urls']:
-            message_body += f"\n- {video['song']}: {video['url']}"
-    
-    message_body += "\n\n¡Disfruta la música!"
-    
+    # Paso 3: Enviar notificaciones si se proporcionó un correo
     if email:
+        email_content = generate_email_content(query, youtube_result, spotify_result, songs)
         notification_tool.send_email(
             to_email=email,
-            subject=f"Tu lista de reproducción para {query}",
-            body=message_body
+            subject=email_content["subject"],
+            body=email_content["body"]
         )
-        notification_sent = True
+        print("📬 Correo electrónico enviado correctamente.")
     
-    if phone:
-        notification_tool.send_whatsapp(
-            phone_number=phone,
-            message=message_body
-        )
-        notification_sent = True
-    
-    # Devolver resultados
     return {
         "query": query,
-        "songs": selected_songs,
-        "youtube_result": {},  # Devolver un diccionario vacío para YouTube
+        "songs": songs,
+        "youtube_result": youtube_result,
         "spotify_result": spotify_result,
-        "notification_sent": notification_sent
+        "email_sent": bool(email)
     }
-    
 
-# Ejemplo de uso
+def validate_email(email):
+    """
+    Valida si una cadena es un correo electrónico válido.
+   
+    Args:
+        email (str): La cadena a validar.
+   
+    Returns:
+        bool: True si es un correo válido, False en caso contrario.
+    """
+    pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+    return re.match(pattern, email) is not None
+
+def main():
+    """
+    Función principal que maneja la interfaz de línea de comandos (CLI).
+    """
+    print("🎵 Bienvenido al Generador de Listas de Reproducción 🎵")
+    print("-----------------------------------------------------")
+    
+    # Solicitar el término de búsqueda
+    query = input("¿Qué grupo o tipo de música te gustaría buscar? (por ejemplo, 'Rock Clásico', 'AC/DC'): ").strip()
+    if not query:
+        print("❌ Debes ingresar un grupo o tipo de música. Saliendo...")
+        return
+    
+    # Solicitar el número de canciones
+    num_songs = input("¿Cuántas canciones te gustaría incluir en la playlist? (por defecto: 20): ").strip()
+    num_songs = int(num_songs) if num_songs.isdigit() else 20
+    
+    # Solicitar si desea recibir una notificación
+    send_notification = input("¿Deseas recibir una notificación con los resultados? (s/n): ").strip().lower()
+    email = None
+    if send_notification == "s":
+        email = input("Ingresa tu correo electrónico: ").strip()
+        if not validate_email(email):
+            print("❌ El correo electrónico no es válido. No se enviará notificación.")
+            email = None
+    
+    print("\n🔍 Buscando canciones y creando listas de reproducción...")
+    try:
+        result = create_music_recommendation(query, email, num_songs)
+        if result is None:
+            print("\n❌ No se pudo crear la lista de reproducción. No se encontraron suficientes canciones.")
+            return
+        print("\n🎵 Lista de reproducción creada exitosamente 🎵")
+        print(f"🔍 Búsqueda: {result['query']}")
+        print("\n🎶 Canciones incluidas:")
+        for i, song in enumerate(result["songs"], 1):
+            print(f"{i}. {song}")
+        print(f"\n🎧 Escucha la lista en YouTube: {result['youtube_result']['playlist_url']}")
+        print(f"🎧 Escucha la lista en Spotify: {result['spotify_result']['playlist_url']}")
+        if result["email_sent"]:
+            print("\n📬 Se ha enviado una notificación con los detalles.")
+    except Exception as e:
+        print(f"❌ Ocurrió un error: {e}")
+        print("Por favor, verifica tu conexión a internet o las credenciales de las APIs.")
+
+# Ejecutar el programa principal
 if __name__ == "__main__":
-    # Verificar disponibilidad de API keys
-    if not os.environ.get("SPOTIFY_CLIENT_ID") or not os.environ.get("SPOTIFY_CLIENT_SECRET"):
-        print("⚠️ ADVERTENCIA: No se encontraron las credenciales de Spotify")
-    
-    # Ejecutar el flujo de recomendación de música
-    result = create_music_recommendation(
-        query="AC/DC",
-        email="usuario@ejemplo.com",
-        # phone="+1234567890"  # Descomentar para enviar por WhatsApp
-    )
-    
-    # Mostrar resultados de manera más amigable
-    print("\n🎵 Lista de reproducción creada exitosamente 🎵")
-    print(f"🔍 Búsqueda: {result['query']}")
-    print("\n🎶 Canciones incluidas:")
+    main()
