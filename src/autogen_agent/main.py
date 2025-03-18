@@ -1,4 +1,3 @@
-from autogen import AssistantAgent, UserProxyAgent, config_list_from_json
 import os
 import requests
 from dotenv import load_dotenv
@@ -9,10 +8,8 @@ from google.oauth2.credentials import Credentials
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import re
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-from bs4 import BeautifulSoup
 import re
 
 
@@ -570,125 +567,6 @@ youtube_tool = YouTubeTool()
 spotify_tool = SpotifyTool()
 notification_tool = NotificationTool()
 
-# Agente de Búsqueda en Internet
-search_agent = AssistantAgent(
-    name="search_agent",
-    llm_config={"config_list": active_config},
-    system_message="""
-    Eres un agente especializado en buscar listas de reproducción en internet.
-    Tu tarea es encontrar las canciones más populares según el género o artista solicitado,
-    y crear una lista consolidada de las canciones. Debes utilizar la API de DuckDuckGo
-    para buscar listas de reproducción, tops de canciones o videos.
-    
-    Tu salida DEBE ser una lista de Python con los títulos de las canciones,
-    para que otros agentes puedan utilizarla directamente.
-    
-    Ejemplo de salida:
-    ```python
-    ["Canción 1", "Canción 2", "Canción 3", "Canción 4", "Canción 5"]
-    ```
-    """
-)
-
-# Agente de YouTube
-youtube_agent = AssistantAgent(
-    name="youtube_agent",
-    llm_config={"config_list": active_config},
-    system_message="""
-    Eres un agente especializado en crear listas de reproducción en YouTube.
-    Tu tarea es tomar una lista de canciones proporcionada por el agente de búsqueda,
-    y utilizar la API de YouTube para buscar cada canción y añadirla a una lista de reproducción.
-    
-    Debes devolver:
-    1. La URL de la lista de reproducción creada
-    2. Una lista de las URLs de los videos individuales
-    
-    Formato de salida:
-    ```python
-    {
-        "playlist_url": "URL_de_la_playlist",
-        "video_urls": [
-            {"song": "Título original", "video_title": "Título del video", "url": "URL_del_video"},
-            ...
-        ]
-    }
-    ```
-    """
-)
-
-# Agente de Spotify
-spotify_agent = AssistantAgent(
-    name="spotify_agent",
-    llm_config={"config_list": active_config},
-    system_message="""
-    Eres un agente especializado en crear listas de reproducción en Spotify.
-    Tu tarea es tomar una lista de canciones proporcionada por el agente de búsqueda,
-    y utilizar la API de Spotify para buscar cada canción y añadirla a una lista de reproducción.
-    
-    Debes devolver:
-    1. La URL de la lista de reproducción creada
-    2. Información detallada sobre las canciones añadidas
-    
-    Formato de salida:
-    ```python
-    {
-        "playlist_url": "URL_de_la_playlist",
-        "track_info": [
-            {
-                "original_query": "Consulta original",
-                "track_name": "Nombre de la canción en Spotify",
-                "artist": "Nombre del artista",
-                "album": "Nombre del álbum",
-                "uri": "URI de Spotify"
-            },
-            ...
-        ]
-    }
-    ```
-    """
-)
-
-# Agente de Notificaciones
-notification_agent = AssistantAgent(
-    name="notification_agent",
-    llm_config={"config_list": active_config},
-    system_message="""
-    Eres un agente especializado en enviar notificaciones por correo electrónico.
-    Tu tarea es generar un correo electrónico con un estilo informal y divertido,
-    similar a un presentador de MTV, que incluya:
-    1. Un resumen de la playlist creada.
-    2. Enlaces a las listas de reproducción en YouTube y Spotify.
-    3. Una descripción amigable de las canciones incluidas.
-    
-    Formato de salida:
-    ```python
-    {
-        "subject": "Asunto del correo",
-        "body": "Cuerpo del correo"
-    }
-    ```
-    """
-)
-
-# Agente Coordinador
-coordinator = UserProxyAgent(
-    name="coordinator",
-    human_input_mode="NEVER",
-    code_execution_config={"work_dir": "coding"},
-    system_message="""
-    Eres el coordinador principal del sistema de recomendación musical.
-    Tu trabajo es:
-    1. Recibir solicitudes de usuarios sobre listas de reproducción
-    2. Delegar tareas a los agentes especializados
-    3. Recopilar y procesar resultados
-    4. Entregar el producto final al usuario
-    
-    Debes coordinar el flujo completo, asegurándote de que:
-    - El agente de búsqueda use DuckDuckGo para encontrar canciones y genere una lista de Python
-    - El agente de YouTube use la API para buscar cada título y crear una lista de reproducción
-    - El agente de Spotify use la API para crear una lista de reproducción a partir de los resultados
-    """
-)
 
 def generate_email_content(query, youtube_result, spotify_result, songs):
     """
